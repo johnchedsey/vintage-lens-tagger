@@ -41,6 +41,16 @@ LOG_FILE = LOG_DIR / "cr3_lens_tagger.log"
 
 RAW_EXTENSIONS = ("*.CR3", "*.cr3", "*.DNG", "*.dng")
 
+# Shown in a field when the selected files have different existing values
+# for that tag. Applying with this value left in place skips writing that
+# tag entirely, so each file keeps whatever it already had.
+KEEP_PLACEHOLDER = "<keep>"
+
+# Offered in the dropdown alongside <keep> when some of the selected files
+# have a value for a tag and others have none at all. Unlike <keep>, actively
+# selecting this clears the tag (writes it blank) on every selected file.
+BLANK_PLACEHOLDER = "<blank>"
+
 # Not hardcoded to any specific user — resolves to whoever is running the
 # script. Used as the starting folder for file/folder pickers.
 DEFAULT_PICTURES_DIR = str(Path.home() / "Pictures")
@@ -214,10 +224,17 @@ class CR3LensTagger(tk.Tk):
         scrollbar = ttk.Scrollbar(list_frame)
         scrollbar.pack(side="right", fill="y")
         self.file_listbox = tk.Listbox(
-            list_frame, yscrollcommand=scrollbar.set, selectmode="extended", height=8
+            list_frame, yscrollcommand=scrollbar.set, selectmode="extended", height=8,
+            exportselection=False,
         )
         self.file_listbox.pack(side="left", fill="both", expand=True)
         scrollbar.config(command=self.file_listbox.yview)
+        self.file_listbox.bind("<<ListboxSelect>>", self._on_file_selection_change)
+
+        self.selection_status_var = tk.StringVar(value="0 out of 0 files will be updated")
+        ttk.Label(file_frame, textvariable=self.selection_status_var).pack(
+            anchor="w", padx=8, pady=(0, 8)
+        )
 
         # Preset row
         preset_frame = ttk.LabelFrame(self, text="2. Lens preset (optional)")
@@ -243,15 +260,23 @@ class CR3LensTagger(tk.Tk):
 
         ttk.Label(grid, text="Focal Length (mm):").grid(row=0, column=0, sticky="w", pady=4)
         self.focal_length_var = tk.StringVar()
-        ttk.Entry(grid, textvariable=self.focal_length_var, width=20).grid(row=0, column=1, sticky="w", padx=6)
+        self.focal_length_combo = ttk.Combobox(grid, textvariable=self.focal_length_var, width=18)
+        self.focal_length_combo.grid(row=0, column=1, sticky="w", padx=6)
 
         ttk.Label(grid, text="Lens Maker:").grid(row=1, column=0, sticky="w", pady=4)
         self.lens_maker_var = tk.StringVar()
-        ttk.Entry(grid, textvariable=self.lens_maker_var, width=30).grid(row=1, column=1, sticky="w", padx=6)
+        self.lens_maker_combo = ttk.Combobox(grid, textvariable=self.lens_maker_var, width=28)
+        self.lens_maker_combo.grid(row=1, column=1, sticky="w", padx=6)
 
         ttk.Label(grid, text="Lens Model:").grid(row=2, column=0, sticky="w", pady=4)
         self.lens_model_var = tk.StringVar()
-        ttk.Entry(grid, textvariable=self.lens_model_var, width=40).grid(row=2, column=1, sticky="w", padx=6)
+        self.lens_model_combo = ttk.Combobox(grid, textvariable=self.lens_model_var, width=38)
+        self.lens_model_combo.grid(row=2, column=1, sticky="w", padx=6)
+
+        # Tracks what we last set programmatically per field, so a later
+        # autofill only overwrites a field if the user hasn't typed
+        # something of their own into it since.
+        self._autofilled_values = {"focal_length": None, "lens_maker": None, "lens_model": None}
 
         self.keep_backup_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
@@ -349,38 +374,40 @@ class CR3LensTagger(tk.Tk):
         for path in self.selected_files:
             self.file_listbox.insert("end", str(path))
         self.file_count_var.set(f"{len(self.selected_files)} files selected")
+        self._update_selection_status()
 
-    def _read_existing_tags(self, file_path: Path) -> dict:
-        """Read whatever Focal Length / Lens Make / Lens Model already exist
-        in a file (checking both EXIF and XMP), so we can offer them back
-        as a starting point instead of the fields defaulting to blank."""
-        if not self.exiftool_path:
-            return {}
-        args = [
-            "-j", "-G1",
-            "-EXIF:FocalLength", "-EXIF:LensMake", "-EXIF:LensModel",
-            "-XMP:LensMake", "-XMP:LensModel",
-            str(file_path),
-        ]
-        try:
-            result = run_exiftool(self.exiftool_path, args)
-            records = json.loads(result.stdout) if result.stdout else []
-        except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
-            log.warning("Could not read existing metadata from %s: %s", file_path, exc)
-            return {}
-        if not records:
-            return {}
+    def _on_file_selection_change(self, _event=None):
+        self._update_selection_status()
+        self._autofill_from_existing()
 
-        rec = records[0]
+    def _update_selection_status(self):
+        total = len(self.selected_files)
+        indices = self.file_listbox.curselection()
+        count = len(indices) if indices else total
+        self.selection_status_var.set(f"{count} out of {total} files will be updated")
+
+    def _get_active_files(self) -> list[Path]:
+        """Files that will actually be written to: the highlighted subset
+        of the list, or every file if nothing is highlighted."""
+        indices = self.file_listbox.curselection()
+        if not indices:
+            return list(self.selected_files)
+        return [self.selected_files[i] for i in indices]
+
+    @staticmethod
+    def _extract_tags_from_record(rec: dict) -> dict:
+        """Pull FocalLength/LensMake/LensModel out of one exiftool -j -G1
+        record, preferring EXIF over XMP, and normalize focal length to a
+        plain number."""
         focal = maker = model = None
         for key, value in rec.items():
-            if key in ("SourceFile", "ExifTool"):
+            if key in ("SourceFile", "ExifTool") or not value:
                 continue
-            if "FocalLength" in key and focal is None and value:
+            if "FocalLength" in key and focal is None:
                 focal = value
-            elif "LensMake" in key and maker is None and value:
+            elif "LensMake" in key and maker is None:
                 maker = value
-            elif "LensModel" in key and model is None and value:
+            elif "LensModel" in key and model is None:
                 model = value
 
         found = {}
@@ -392,31 +419,88 @@ class CR3LensTagger(tk.Tk):
             found["lens_model"] = str(model)
         return found
 
+    def _read_existing_tags_batch(self, file_paths: list[Path]) -> list[dict]:
+        """Read existing Focal Length / Lens Make / Lens Model (EXIF and
+        XMP) from every given file in a single exiftool call."""
+        if not self.exiftool_path or not file_paths:
+            return []
+        args = [
+            "-j", "-G1",
+            "-EXIF:FocalLength", "-EXIF:LensMake", "-EXIF:LensModel",
+            "-XMP:LensMake", "-XMP:LensModel",
+        ]
+        args.extend(str(p) for p in file_paths)
+        try:
+            result = run_exiftool(self.exiftool_path, args)
+            records = json.loads(result.stdout) if result.stdout else []
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+            log.warning("Could not read existing metadata: %s", exc)
+            return []
+        return [self._extract_tags_from_record(rec) for rec in records]
+
+    def _set_field(self, var: tk.StringVar, combo: ttk.Combobox, key: str,
+                    display_value: str, dropdown_values: list[str]):
+        """Update one field's dropdown list, and its displayed text — but
+        only if the current text is blank or matches what we last set
+        programmatically (so a value the user actually typed is left alone)."""
+        combo["values"] = dropdown_values
+        current = var.get()
+        if not current.strip() or current == self._autofilled_values.get(key):
+            var.set(display_value)
+            self._autofilled_values[key] = display_value
+
     def _autofill_from_existing(self):
-        """Pre-fill any currently-blank fields from the first selected
-        file's existing metadata. Never overwrites something you've already
-        typed in."""
-        if not self.exiftool_path or not self.selected_files:
+        """Inspect existing metadata across the active file selection (the
+        highlighted subset, or all files if none are highlighted). If every
+        file agrees (or is blank), pre-fill that shared value. If files
+        disagree, show '<keep>' plus a dropdown of the differing values so
+        applying won't clobber files that already have good data."""
+        active_files = self._get_active_files()
+        if not self.exiftool_path or not active_files:
             return
-        sample = self.selected_files[0]
-        found = self._read_existing_tags(sample)
-        if not found:
+        records = self._read_existing_tags_batch(active_files)
+        if not records:
             return
 
-        filled = []
-        if not self.focal_length_var.get().strip() and found.get("focal_length"):
-            self.focal_length_var.set(found["focal_length"])
-            filled.append("Focal Length")
-        if not self.lens_maker_var.get().strip() and found.get("lens_maker"):
-            self.lens_maker_var.set(found["lens_maker"])
-            filled.append("Lens Maker")
-        if not self.lens_model_var.get().strip() and found.get("lens_model"):
-            self.lens_model_var.set(found["lens_model"])
-            filled.append("Lens Model")
+        summary = []
+        for key, label, var, combo in (
+            ("focal_length", "Focal Length", self.focal_length_var, self.focal_length_combo),
+            ("lens_maker", "Lens Maker", self.lens_maker_var, self.lens_maker_combo),
+            ("lens_model", "Lens Model", self.lens_model_var, self.lens_model_combo),
+        ):
+            distinct = sorted({rec[key] for rec in records if rec.get(key)})
+            has_blank = any(not rec.get(key) for rec in records)
 
-        if filled:
-            log.info("Auto-filled %s from existing metadata in %s: %s", filled, sample.name, found)
-            self._log(f"Found existing metadata in {sample.name} — pre-filled {', '.join(filled)}.")
+            if not distinct:
+                # Nothing found in this selection. If the field is still
+                # showing a value we set on behalf of a previous selection,
+                # clear it — but leave alone anything the user actually
+                # typed themselves.
+                combo["values"] = []
+                current = var.get()
+                if current.strip() and current == self._autofilled_values.get(key):
+                    var.set("")
+                    self._autofilled_values[key] = None
+                continue
+
+            if len(distinct) == 1 and not has_blank:
+                # Every file agrees and none are missing the tag — just fill it in.
+                self._set_field(var, combo, key, distinct[0], distinct)
+                summary.append(f"{label}={distinct[0]}")
+            else:
+                # Either multiple different values, or some files have a
+                # value and others don't — either way this needs a choice.
+                dropdown_values = [KEEP_PLACEHOLDER]
+                if has_blank:
+                    dropdown_values.append(BLANK_PLACEHOLDER)
+                dropdown_values.extend(distinct)
+                self._set_field(var, combo, key, KEEP_PLACEHOLDER, dropdown_values)
+                note = f"{len(distinct)} different value(s)" + (" + some blank" if has_blank else "")
+                summary.append(f"{label}=<keep> ({note})")
+
+        if summary:
+            log.info("Autofill across %d file(s): %s", len(active_files), summary)
+            self._log(f"Existing metadata across selected files — {', '.join(summary)}")
 
     # ---- presets -----------------------------------------------
 
@@ -501,20 +585,51 @@ class CR3LensTagger(tk.Tk):
             messagebox.showwarning(APP_NAME, "Select at least one CR3/DNG file first.")
             return
 
-        focal = self.focal_length_var.get().strip()
-        maker = self.lens_maker_var.get().strip()
-        model = self.lens_model_var.get().strip()
-
-        if not (focal or maker or model):
-            messagebox.showwarning(APP_NAME, "Fill in at least one of Focal Length, Lens Maker, or Lens Model.")
+        active_files = self._get_active_files()
+        if not active_files:
+            messagebox.showwarning(APP_NAME, "No files are selected to update.")
             return
 
-        if focal:
+        def resolve_field(raw_value: str):
+            """Returns ('skip', None) / ('clear', '') / ('write', value)."""
+            value = raw_value.strip()
+            if value == KEEP_PLACEHOLDER:
+                return "skip", None
+            if value == BLANK_PLACEHOLDER:
+                return "clear", ""
+            if not value:
+                return "skip", None
+            return "write", value
+
+        focal_action, focal_value = resolve_field(self.focal_length_var.get())
+        maker_action, maker_value = resolve_field(self.lens_maker_var.get())
+        model_action, model_value = resolve_field(self.lens_model_var.get())
+
+        if focal_action == "skip" and maker_action == "skip" and model_action == "skip":
+            messagebox.showwarning(
+                APP_NAME,
+                "Fill in at least one of Focal Length, Lens Maker, or Lens Model "
+                "(or pick a value from the dropdown instead of leaving it on <keep>).",
+            )
+            return
+
+        if focal_action == "write":
             try:
-                float(focal)
+                float(focal_value)
             except ValueError:
                 messagebox.showerror(APP_NAME, "Focal Length must be a number (e.g. 50 or 58.0).")
                 return
+
+        skipped = [label for label, action in (
+            ("Focal Length", focal_action), ("Lens Maker", maker_action), ("Lens Model", model_action)
+        ) if action == "skip"]
+        cleared = [label for label, action in (
+            ("Focal Length", focal_action), ("Lens Maker", maker_action), ("Lens Model", model_action)
+        ) if action == "clear"]
+        if skipped:
+            self._log(f"Leaving unchanged (selection had differing values): {', '.join(skipped)}")
+        if cleared:
+            self._log(f"Clearing (blanking) on all selected files: {', '.join(cleared)}")
 
         # Group-qualified tags: CR3 files have BOTH a standard EXIF
         # LensMake/LensModel tag and a separate (non-writable) Canon
@@ -524,25 +639,26 @@ class CR3LensTagger(tk.Tk):
         # succeeds. Targeting "EXIF:" explicitly, plus mirroring into XMP
         # for apps that read lens info from there instead, fixes it.
         args = ["-m"]  # ignore minor warnings that would otherwise block the write
-        if focal:
-            args.append(f"-EXIF:FocalLength={focal}")
-        if maker:
-            args.append(f"-EXIF:LensMake={maker}")
-            args.append(f"-XMP-exifEX:LensMake={maker}")
-        if model:
-            args.append(f"-EXIF:LensModel={model}")
-            args.append(f"-XMP-exifEX:LensModel={model}")
-            args.append(f"-XMP-aux:Lens={model}")
+        if focal_action != "skip":
+            args.append(f"-EXIF:FocalLength={focal_value}")
+        if maker_action != "skip":
+            args.append(f"-EXIF:LensMake={maker_value}")
+            args.append(f"-XMP-exifEX:LensMake={maker_value}")
+        if model_action != "skip":
+            args.append(f"-EXIF:LensModel={model_value}")
+            args.append(f"-XMP-exifEX:LensModel={model_value}")
+            args.append(f"-XMP-aux:Lens={model_value}")
 
         if not self.keep_backup_var.get():
             args.append("-overwrite_original")
 
-        args.extend(str(p) for p in self.selected_files)
+        args.extend(str(p) for p in active_files)
 
         self.apply_btn.config(state="disabled")
-        log.info("Applying metadata to %d file(s): FocalLength=%r LensMake=%r LensModel=%r",
-                  len(self.selected_files), focal, maker, model)
-        self._log(f"Running exiftool on {len(self.selected_files)} file(s)...")
+        log.info("Applying metadata to %d file(s): FocalLength=%r(%s) LensMake=%r(%s) LensModel=%r(%s)",
+                  len(active_files),
+                  focal_value, focal_action, maker_value, maker_action, model_value, model_action)
+        self._log(f"Running exiftool on {len(active_files)} file(s)...")
         self.update_idletasks()
 
         try:
@@ -566,14 +682,14 @@ class CR3LensTagger(tk.Tk):
         if result.returncode == 0:
             log.info("exiftool completed successfully.")
             self._log("Done.")
-            self._verify_written_tags()
+            self._verify_written_tags(active_files)
             messagebox.showinfo(APP_NAME, "Metadata written successfully. See log for a per-file verification readout.")
         else:
             log.error("exiftool exited with code %d", result.returncode)
             self._log(f"exiftool exited with code {result.returncode}")
             messagebox.showerror(APP_NAME, "exiftool reported an error. See the log for details.")
 
-    def _verify_written_tags(self):
+    def _verify_written_tags(self, files: list[Path]):
         """Read back the tags we just wrote, per file and per group, so we
         can see exactly where the data actually landed (EXIF vs XMP vs
         nowhere) instead of trusting exiftool's generic success message."""
@@ -582,7 +698,7 @@ class CR3LensTagger(tk.Tk):
             "-EXIF:FocalLength", "-EXIF:LensMake", "-EXIF:LensModel",
             "-XMP:LensMake", "-XMP:LensModel",
         ]
-        read_args.extend(str(p) for p in self.selected_files)
+        read_args.extend(str(p) for p in files)
         try:
             result = run_exiftool(self.exiftool_path, read_args)
         except (OSError, subprocess.SubprocessError) as exc:
