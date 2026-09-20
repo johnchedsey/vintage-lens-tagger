@@ -456,6 +456,11 @@ class CR3LensTagger(tk.Tk):
         disagree, show '<keep>' plus a dropdown of the differing values so
         applying won't clobber files that already have good data."""
         active_files = self._get_active_files()
+
+        # A preset chosen for the previous batch/selection may not describe
+        # this one — clear it rather than let it look still-applied.
+        self.preset_var.set("")
+
         if not self.exiftool_path or not active_files:
             return
         records = self._read_existing_tags_batch(active_files)
