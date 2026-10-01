@@ -21,7 +21,7 @@ electronically.
 
 3. **Run the app**
    ```
-   python cr3_lens_tagger.py
+   python lens_tagger.py
    ```
 
 ## Using it
