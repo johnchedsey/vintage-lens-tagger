@@ -10,7 +10,7 @@ Requires: exiftool (https://exiftool.org) available on PATH, or point the
 tool at exiftool.exe manually (this location is remembered between runs).
 
 Usage:
-    python cr3_lens_tagger.py
+    python lens_tagger.py
 
 Logs (including full tracebacks for any crash) are written to:
     %APPDATA%\\CR3LensTagger\\logs\\cr3_lens_tagger.log   (Windows)
