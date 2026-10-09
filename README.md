@@ -20,9 +20,13 @@ electronically.
    with the standard Windows installer, so no extra packages are needed.
 
 3. **Run the app**
-   ```
-   python lens_tagger.py
-   ```
+   - Double-click **`Lens Tagger.pyw`** — it opens the app without a console
+     window. Right-click it → *Send to → Desktop (create shortcut)* for a
+     desktop icon, or right-click the shortcut → *Pin to Start*.
+   - Or from a terminal (shows log output live):
+     ```
+     python lens_tagger.py
+     ```
 
 ## Using it
 

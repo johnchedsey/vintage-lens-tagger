@@ -71,12 +71,16 @@ def setup_logging() -> logging.Logger:
     file_handler.setFormatter(fmt)
     file_handler.setLevel(logging.DEBUG)
 
-    console_handler = logging.StreamHandler(sys.stderr)
-    console_handler.setFormatter(fmt)
-    console_handler.setLevel(logging.DEBUG)
-
     logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
+
+    # No stderr when launched windowless via pythonw (e.g. double-clicking
+    # the .pyw launcher); the log file still captures everything.
+    if sys.stderr is not None:
+        console_handler = logging.StreamHandler(sys.stderr)
+        console_handler.setFormatter(fmt)
+        console_handler.setLevel(logging.DEBUG)
+        logger.addHandler(console_handler)
+
     logger.info("=== %s starting (log file: %s) ===", APP_NAME, LOG_FILE)
     return logger
 
@@ -150,15 +154,67 @@ def _extract_leading_number(value: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# High-DPI support
+# --------------------------------------------------------------------------
+
+def enable_windows_dpi_awareness():
+    """Tell Windows we handle DPI scaling ourselves.
+
+    Without this, Windows renders the window at 96 DPI and bitmap-stretches
+    it on high-DPI (e.g. 4K/UHD) monitors, which makes everything blurry.
+    Must be called before the Tk root window is created.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        try:
+            # 1 = system DPI aware. Tk doesn't rescale on WM_DPICHANGED, so
+            # per-monitor awareness would leave the window mis-sized when
+            # dragged between monitors with different scaling.
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except (AttributeError, OSError):
+            ctypes.windll.user32.SetProcessDPIAware()  # pre-Windows 8.1
+    except Exception:
+        log.warning("Could not enable DPI awareness:\n%s", traceback.format_exc())
+
+
+class AskStringDialog(tkinter.simpledialog.Dialog):
+    """Like simpledialog.askstring, but with a configurable entry width."""
+
+    def __init__(self, parent, title, prompt, initialvalue="", width=50):
+        self.prompt = prompt
+        self.initialvalue = initialvalue
+        self.width = width
+        self.result = None
+        super().__init__(parent, title)
+
+    def body(self, master):
+        ttk.Label(master, text=self.prompt).grid(row=0, column=0, sticky="w", padx=5, pady=(5, 2))
+        self.entry = ttk.Entry(master, width=self.width)
+        self.entry.grid(row=1, column=0, sticky="ew", padx=5, pady=(0, 5))
+        self.entry.insert(0, self.initialvalue)
+        self.entry.select_range(0, tk.END)
+        return self.entry
+
+    def apply(self):
+        self.result = self.entry.get()
+
+
+# --------------------------------------------------------------------------
 # Main application
 # --------------------------------------------------------------------------
 
 class CR3LensTagger(tk.Tk):
     def __init__(self):
         super().__init__()
+        # Ratio of the display's DPI to the 96 DPI baseline the layout was
+        # designed at; used to scale hard-coded pixel sizes. Fonts scale on
+        # their own because Tk sizes them in points.
+        self._ui_scale = max(1.0, self.winfo_fpixels("1i") / 96)
         self.title(APP_NAME)
-        self.geometry("740x660")
-        self.minsize(660, 580)
+        self.geometry(f"{self._px(740)}x{self._px(660)}")
+        self.minsize(self._px(660), self._px(580))
 
         # Global safety net: any exception raised inside a Tk callback
         # (button click, etc.) lands here instead of vanishing.
@@ -197,8 +253,14 @@ class CR3LensTagger(tk.Tk):
 
     # ---- UI construction -------------------------------------------------
 
+    def _px(self, value):
+        """Scale a pixel size (or a (before, after) padding tuple) for the display DPI."""
+        if isinstance(value, tuple):
+            return tuple(round(v * self._ui_scale) for v in value)
+        return round(value * self._ui_scale)
+
     def _build_ui(self):
-        pad = {"padx": 10, "pady": 6}
+        pad = {"padx": self._px(10), "pady": self._px(6)}
 
         # exiftool status bar
         status_frame = ttk.Frame(self)
@@ -212,15 +274,15 @@ class CR3LensTagger(tk.Tk):
         file_frame.pack(fill="both", expand=True, **pad)
 
         btn_row = ttk.Frame(file_frame)
-        btn_row.pack(fill="x", padx=8, pady=(8, 4))
+        btn_row.pack(fill="x", padx=self._px(8), pady=self._px((8, 4)))
         ttk.Button(btn_row, text="Add Files...", command=self._add_files).pack(side="left")
-        ttk.Button(btn_row, text="Add Folder...", command=self._add_folder).pack(side="left", padx=6)
+        ttk.Button(btn_row, text="Add Folder...", command=self._add_folder).pack(side="left", padx=self._px(6))
         ttk.Button(btn_row, text="Clear List", command=self._clear_files).pack(side="left")
         self.file_count_var = tk.StringVar(value="0 files selected")
         ttk.Label(btn_row, textvariable=self.file_count_var).pack(side="right")
 
         list_frame = ttk.Frame(file_frame)
-        list_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        list_frame.pack(fill="both", expand=True, padx=self._px(8), pady=self._px((0, 8)))
         scrollbar = ttk.Scrollbar(list_frame)
         scrollbar.pack(side="right", fill="y")
         self.file_listbox = tk.Listbox(
@@ -233,45 +295,45 @@ class CR3LensTagger(tk.Tk):
 
         self.selection_status_var = tk.StringVar(value="0 out of 0 files will be updated")
         ttk.Label(file_frame, textvariable=self.selection_status_var).pack(
-            anchor="w", padx=8, pady=(0, 8)
+            anchor="w", padx=self._px(8), pady=self._px((0, 8))
         )
 
         # Preset row
         preset_frame = ttk.LabelFrame(self, text="2. Lens preset (optional)")
         preset_frame.pack(fill="x", **pad)
         preset_row = ttk.Frame(preset_frame)
-        preset_row.pack(fill="x", padx=8, pady=8)
+        preset_row.pack(fill="x", padx=self._px(8), pady=self._px(8))
         ttk.Label(preset_row, text="Saved lens:").pack(side="left")
         self.preset_var = tk.StringVar()
         self.preset_combo = ttk.Combobox(
             preset_row, textvariable=self.preset_var, state="readonly", width=35
         )
-        self.preset_combo.pack(side="left", padx=6)
+        self.preset_combo.pack(side="left", padx=self._px(6))
         self.preset_combo.bind("<<ComboboxSelected>>", self._on_preset_selected)
-        ttk.Button(preset_row, text="Save current as preset", command=self._save_preset).pack(side="left", padx=6)
-        ttk.Button(preset_row, text="Update selected preset", command=self._update_preset).pack(side="left", padx=6)
+        ttk.Button(preset_row, text="Save current as preset", command=self._save_preset).pack(side="left", padx=self._px(6))
+        ttk.Button(preset_row, text="Update selected preset", command=self._update_preset).pack(side="left", padx=self._px(6))
         ttk.Button(preset_row, text="Delete preset", command=self._delete_preset).pack(side="left")
 
         # Metadata fields
         fields_frame = ttk.LabelFrame(self, text="3. Metadata to write")
         fields_frame.pack(fill="x", **pad)
         grid = ttk.Frame(fields_frame)
-        grid.pack(fill="x", padx=8, pady=8)
+        grid.pack(fill="x", padx=self._px(8), pady=self._px(8))
 
-        ttk.Label(grid, text="Focal Length (mm):").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Label(grid, text="Focal Length (mm):").grid(row=0, column=0, sticky="w", pady=self._px(4))
         self.focal_length_var = tk.StringVar()
         self.focal_length_combo = ttk.Combobox(grid, textvariable=self.focal_length_var, width=18)
-        self.focal_length_combo.grid(row=0, column=1, sticky="w", padx=6)
+        self.focal_length_combo.grid(row=0, column=1, sticky="w", padx=self._px(6))
 
-        ttk.Label(grid, text="Lens Maker:").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Label(grid, text="Lens Maker:").grid(row=1, column=0, sticky="w", pady=self._px(4))
         self.lens_maker_var = tk.StringVar()
         self.lens_maker_combo = ttk.Combobox(grid, textvariable=self.lens_maker_var, width=28)
-        self.lens_maker_combo.grid(row=1, column=1, sticky="w", padx=6)
+        self.lens_maker_combo.grid(row=1, column=1, sticky="w", padx=self._px(6))
 
-        ttk.Label(grid, text="Lens Model:").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Label(grid, text="Lens Model:").grid(row=2, column=0, sticky="w", pady=self._px(4))
         self.lens_model_var = tk.StringVar()
         self.lens_model_combo = ttk.Combobox(grid, textvariable=self.lens_model_var, width=38)
-        self.lens_model_combo.grid(row=2, column=1, sticky="w", padx=6)
+        self.lens_model_combo.grid(row=2, column=1, sticky="w", padx=self._px(6))
 
         # Tracks what we last set programmatically per field, so a later
         # autofill only overwrites a field if the user hasn't typed
@@ -283,7 +345,7 @@ class CR3LensTagger(tk.Tk):
             fields_frame,
             text="Keep original backup files (adds _original copies)",
             variable=self.keep_backup_var,
-        ).pack(anchor="w", padx=8, pady=(0, 8))
+        ).pack(anchor="w", padx=self._px(8), pady=self._px((0, 8)))
 
         # Apply button
         apply_row = ttk.Frame(self)
@@ -295,7 +357,7 @@ class CR3LensTagger(tk.Tk):
         log_frame = ttk.LabelFrame(self, text=f"Log  (also saved to {LOG_FILE.name})")
         log_frame.pack(fill="both", expand=True, **pad)
         self.log_text = tk.Text(log_frame, height=8, wrap="word", state="disabled")
-        self.log_text.pack(fill="both", expand=True, padx=8, pady=8)
+        self.log_text.pack(fill="both", expand=True, padx=self._px(8), pady=self._px(8))
 
     # ---- exiftool detection -----------------------------------------------
 
@@ -530,9 +592,11 @@ class CR3LensTagger(tk.Tk):
             messagebox.showwarning(APP_NAME, "Enter a Lens Model before saving a preset.")
             return
         default_name = f"{maker} {model}".strip()
-        name = tkinter.simpledialog.askstring(
-            "Save preset", "Preset name:", initialvalue=default_name, parent=self
-        )
+        name = AskStringDialog(
+            self, "Save preset", "Preset name:", initialvalue=default_name, width=50
+        ).result
+        if name:
+            name = name.strip()
         if not name:
             return
         self.presets[name] = {"focal_length": focal, "lens_maker": maker, "lens_model": model}
@@ -731,14 +795,25 @@ class CR3LensTagger(tk.Tk):
         self._log("--- end verification ---")
 
 
+def main():
+    try:
+        enable_windows_dpi_awareness()
+        app = CR3LensTagger()
+        app.mainloop()
+    except Exception as exc:
+        log.critical("Fatal error during startup:\n%s", traceback.format_exc())
+        # When launched windowless there's no console to show the traceback,
+        # so surface it in a dialog too.
+        messagebox.showerror(
+            APP_NAME,
+            f"Could not start:\n\n{exc}\n\nFull details were written to:\n{LOG_FILE}",
+        )
+        raise
+
+
 if __name__ == "__main__":
     if sys.version_info < (3, 10):
         print("This tool requires Python 3.10 or newer (uses 'str | None' type hints).")
         sys.exit(1)
 
-    try:
-        app = CR3LensTagger()
-        app.mainloop()
-    except Exception:
-        log.critical("Fatal error during startup:\n%s", traceback.format_exc())
-        raise
+    main()
