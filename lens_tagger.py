@@ -431,6 +431,18 @@ class CR3LensTagger(tk.Tk):
         self.selected_files.clear()
         self._refresh_file_list()
 
+        # Clearing the list means starting over with a new batch, so the
+        # tagging fields and preset from the last batch no longer apply.
+        self.preset_var.set("")
+        for key, var, combo in (
+            ("focal_length", self.focal_length_var, self.focal_length_combo),
+            ("lens_maker", self.lens_maker_var, self.lens_maker_combo),
+            ("lens_model", self.lens_model_var, self.lens_model_combo),
+        ):
+            var.set("")
+            combo["values"] = []
+            self._autofilled_values[key] = None
+
     def _refresh_file_list(self):
         self.file_listbox.delete(0, "end")
         for path in self.selected_files:
