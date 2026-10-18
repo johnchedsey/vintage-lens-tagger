@@ -34,6 +34,12 @@ electronically.
    Folder grabs every `.CR3` in that folder, non-recursive).
 2. Optionally pick a **saved lens preset** to auto-fill the fields, or type
    in Focal Length / Lens Maker / Lens Model directly.
+   - Or click **Load CSV...** to load a list of the lenses you own (columns:
+     Lens Maker, Lens Model, Focal Length, Aperture; extra columns are shown
+     as notes). **Pick lens from CSV...** opens a searchable list; choosing
+     a row fills Focal Length, Lens Maker, and a Lens Model built from maker,
+     model, and aperture (e.g. `Fuji Fujinon f1.8`). All fields stay
+     editable. The CSV location is remembered between sessions.
 3. **Save current as preset** stores whatever's in the fields for reuse next
    time you shoot with that lens (presets persist between sessions, stored in
    `%APPDATA%\CR3LensTagger\presets.json`).

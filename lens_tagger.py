@@ -18,6 +18,7 @@ Logs (including full tracebacks for any crash) are written to:
 and echoed to the terminal the app was launched from.
 """
 
+import csv
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
+import tkinter.font
 import tkinter.simpledialog
 from tkinter import ttk, filedialog, messagebox
 
@@ -154,6 +156,52 @@ def _extract_leading_number(value: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# Lens list (CSV) helpers
+# --------------------------------------------------------------------------
+
+def normalize_aperture(value: str) -> str:
+    """Tidy hand-typed apertures: 'f.2.8' -> 'f2.8', 'f3.5.' -> 'f3.5',
+    'F4.5-7.1' -> 'f4.5-7.1'. Returns the original text if no number is found."""
+    match = re.search(r"\d+(?:\.\d+)?(?:\s*-\s*\d+(?:\.\d+)?)?", value)
+    if not match:
+        return value.strip()
+    return "f" + re.sub(r"\s+", "", match.group(0))
+
+
+def load_lens_csv(path: Path) -> list[dict]:
+    """Read a lens list CSV with columns: Maker, Model, Focal Length, Aperture,
+    followed by any number of extra columns (shown as notes). A header row
+    is skipped automatically if its focal length column has no digits."""
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        text = path.read_text(encoding="cp1252")
+
+    lenses = []
+    for i, row in enumerate(csv.reader(text.splitlines())):
+        cells = [c.strip() for c in row] + [""] * 4
+        maker, model, focal, aperture = cells[:4]
+        if not maker and not model:
+            continue
+        if i == 0 and not re.search(r"\d", focal):
+            continue  # header row
+        aperture = normalize_aperture(aperture) if aperture else ""
+        lenses.append({
+            "maker": maker,
+            "model": model,
+            "focal": focal,
+            "aperture": aperture,
+            "notes": " · ".join(c for c in cells[4:] if c),
+            # Lens Model tag: maker + model + aperture, e.g. "Fuji Fujinon f1.8"
+            "lens_model": " ".join(p for p in (maker, model, aperture) if p),
+            # Wide end for zooms ("35-105mm" -> "35"); the tag must be a number
+            "focal_length": _extract_leading_number(focal) if re.search(r"\d", focal) else "",
+            "is_zoom": bool(re.search(r"\d\s*-\s*\d", focal)),
+        })
+    return lenses
+
+
+# --------------------------------------------------------------------------
 # High-DPI support
 # --------------------------------------------------------------------------
 
@@ -201,6 +249,119 @@ class AskStringDialog(tkinter.simpledialog.Dialog):
         self.result = self.entry.get()
 
 
+class LensPickerDialog(tk.Toplevel):
+    """Searchable table of lenses from the CSV. Sets self.result to the
+    chosen lens dict (or leaves it None if cancelled)."""
+
+    COLUMNS = (
+        ("maker", "Maker", 120),
+        ("model", "Model", 170),
+        ("focal", "Focal", 80),
+        ("aperture", "Aperture", 80),
+        ("notes", "Notes", 140),
+        ("preset", "Saved preset", 140),
+    )
+
+    def __init__(self, parent, lenses: list[dict], presets: dict, px):
+        super().__init__(parent)
+        self.title("Pick lens from CSV")
+        self.transient(parent)
+        self.geometry(f"{px(820)}x{px(480)}")
+        self.minsize(px(500), px(300))
+        self.result = None
+        self.lenses = lenses
+
+        # Which CSV rows are already saved as presets (matched on the
+        # values they'd write), so it's obvious which still need one.
+        preset_by_values = {
+            (p.get("lens_maker", ""), p.get("lens_model", "")): name
+            for name, p in presets.items()
+        }
+        self.preset_names = [
+            preset_by_values.get((lens["maker"], lens["lens_model"]), "") for lens in lenses
+        ]
+
+        # Default Treeview rows are sized for 96 DPI and clip text on
+        # high-DPI displays; size them from the actual font instead.
+        linespace = tkinter.font.nametofont("TkDefaultFont").metrics("linespace")
+        ttk.Style(self).configure("LensPicker.Treeview", rowheight=linespace + px(6))
+
+        search_row = ttk.Frame(self)
+        search_row.pack(fill="x", padx=px(10), pady=px((10, 6)))
+        ttk.Label(search_row, text="Search:").pack(side="left")
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *_: self._refresh())
+        search_entry = ttk.Entry(search_row, textvariable=self.search_var, width=40)
+        search_entry.pack(side="left", fill="x", expand=True, padx=px(6))
+        self.count_var = tk.StringVar()
+        ttk.Label(search_row, textvariable=self.count_var).pack(side="right")
+
+        table = ttk.Frame(self)
+        table.pack(fill="both", expand=True, padx=px(10))
+        scrollbar = ttk.Scrollbar(table)
+        scrollbar.pack(side="right", fill="y")
+        self.tree = ttk.Treeview(
+            table, columns=[c[0] for c in self.COLUMNS], show="headings",
+            selectmode="browse", style="LensPicker.Treeview", yscrollcommand=scrollbar.set,
+        )
+        for key, heading, width in self.COLUMNS:
+            self.tree.heading(key, text=heading, anchor="w")
+            self.tree.column(key, width=px(width), anchor="w")
+        self.tree.tag_configure("odd", background="#f0f0f0")
+        self.tree.pack(side="left", fill="both", expand=True)
+        scrollbar.config(command=self.tree.yview)
+        self.tree.bind("<Double-1>", lambda _e: self._use_selected())
+        self.tree.bind("<Return>", lambda _e: self._use_selected())
+
+        btn_row = ttk.Frame(self)
+        btn_row.pack(fill="x", padx=px(10), pady=px(10))
+        ttk.Button(btn_row, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(btn_row, text="Use selected lens", command=self._use_selected).pack(
+            side="right", padx=px(6)
+        )
+        ttk.Label(btn_row, text="Double-click a row to use it.").pack(side="left")
+
+        self.bind("<Escape>", lambda _e: self.destroy())
+        search_entry.bind("<Down>", lambda _e: self._focus_first_row())
+        search_entry.bind("<Return>", lambda _e: self._use_selected())
+
+        self._refresh()
+        search_entry.focus_set()
+        self.grab_set()
+        self.wait_window()
+
+    def _refresh(self):
+        terms = self.search_var.get().lower().split()
+        self.tree.delete(*self.tree.get_children())
+        shown = 0
+        for i, lens in enumerate(self.lenses):
+            values = [lens[k] for k, _, _ in self.COLUMNS[:-1]] + [self.preset_names[i]]
+            haystack = " ".join(values + [lens["lens_model"]]).lower()
+            if all(t in haystack for t in terms):
+                # Stripe by visible position so shading stays even while filtering
+                tags = ("odd",) if shown % 2 else ()
+                self.tree.insert("", "end", iid=str(i), values=values, tags=tags)
+                shown += 1
+        self.count_var.set(f"{shown} of {len(self.lenses)} lenses")
+        children = self.tree.get_children()
+        if len(children) == 1:
+            self.tree.selection_set(children[0])
+
+    def _focus_first_row(self):
+        children = self.tree.get_children()
+        if children:
+            self.tree.focus_set()
+            self.tree.selection_set(children[0])
+            self.tree.focus(children[0])
+
+    def _use_selected(self):
+        selection = self.tree.selection()
+        if not selection:
+            return
+        self.result = self.lenses[int(selection[0])]
+        self.destroy()
+
+
 # --------------------------------------------------------------------------
 # Main application
 # --------------------------------------------------------------------------
@@ -213,8 +374,8 @@ class CR3LensTagger(tk.Tk):
         # their own because Tk sizes them in points.
         self._ui_scale = max(1.0, self.winfo_fpixels("1i") / 96)
         self.title(APP_NAME)
-        self.geometry(f"{self._px(740)}x{self._px(660)}")
-        self.minsize(self._px(660), self._px(580))
+        self.geometry(f"{self._px(740)}x{self._px(700)}")
+        self.minsize(self._px(660), self._px(620))
 
         # Global safety net: any exception raised inside a Tk callback
         # (button click, etc.) lands here instead of vanishing.
@@ -224,6 +385,8 @@ class CR3LensTagger(tk.Tk):
         self.exiftool_path = self.config_data.get("exiftool_path") or find_exiftool()
         self.presets = load_presets()
         self.selected_files: list[Path] = []
+        self.lens_csv_path: Path | None = None
+        self.csv_lenses: list[dict] = []
 
         # Start at the last folder used, falling back to this user's
         # Pictures folder (resolved dynamically, never hardcoded).
@@ -233,6 +396,10 @@ class CR3LensTagger(tk.Tk):
         self._build_ui()
         self._refresh_preset_list()
         self._update_exiftool_status()
+
+        saved_csv = self.config_data.get("lens_csv_path")
+        if saved_csv and Path(saved_csv).is_file():
+            self._load_lens_csv(Path(saved_csv), quiet=True)
 
         if self.exiftool_path:
             log.info("Using exiftool at: %s", self.exiftool_path)
@@ -299,10 +466,10 @@ class CR3LensTagger(tk.Tk):
         )
 
         # Preset row
-        preset_frame = ttk.LabelFrame(self, text="2. Lens preset (optional)")
+        preset_frame = ttk.LabelFrame(self, text="2. Lens preset or lens list (optional)")
         preset_frame.pack(fill="x", **pad)
         preset_row = ttk.Frame(preset_frame)
-        preset_row.pack(fill="x", padx=self._px(8), pady=self._px(8))
+        preset_row.pack(fill="x", padx=self._px(8), pady=self._px((8, 4)))
         ttk.Label(preset_row, text="Saved lens:").pack(side="left")
         self.preset_var = tk.StringVar()
         self.preset_combo = ttk.Combobox(
@@ -313,6 +480,17 @@ class CR3LensTagger(tk.Tk):
         ttk.Button(preset_row, text="Save current as preset", command=self._save_preset).pack(side="left", padx=self._px(6))
         ttk.Button(preset_row, text="Update selected preset", command=self._update_preset).pack(side="left", padx=self._px(6))
         ttk.Button(preset_row, text="Delete preset", command=self._delete_preset).pack(side="left")
+
+        csv_row = ttk.Frame(preset_frame)
+        csv_row.pack(fill="x", padx=self._px(8), pady=self._px((4, 8)))
+        ttk.Label(csv_row, text="Lens list:").pack(side="left")
+        ttk.Button(csv_row, text="Load CSV...", command=self._browse_lens_csv).pack(side="left", padx=self._px(6))
+        self.pick_csv_btn = ttk.Button(
+            csv_row, text="Pick lens from CSV...", command=self._pick_from_csv, state="disabled"
+        )
+        self.pick_csv_btn.pack(side="left")
+        self.csv_status_var = tk.StringVar(value="No CSV loaded")
+        ttk.Label(csv_row, textvariable=self.csv_status_var).pack(side="left", padx=self._px(8))
 
         # Metadata fields
         fields_frame = ttk.LabelFrame(self, text="3. Metadata to write")
@@ -603,7 +781,11 @@ class CR3LensTagger(tk.Tk):
         if not model:
             messagebox.showwarning(APP_NAME, "Enter a Lens Model before saving a preset.")
             return
-        default_name = f"{maker} {model}".strip()
+        # CSV-built models already start with the maker ("Fuji Fujinon f1.8")
+        if maker and model.lower().startswith(maker.lower()):
+            default_name = model
+        else:
+            default_name = f"{maker} {model}".strip()
         name = AskStringDialog(
             self, "Save preset", "Preset name:", initialvalue=default_name, width=50
         ).result
@@ -648,6 +830,62 @@ class CR3LensTagger(tk.Tk):
         self._refresh_preset_list()
         log.info("Deleted preset '%s'", name)
         self._log(f"Deleted preset '{name}'")
+
+    # ---- lens list (CSV) -----------------------------------------------
+
+    def _browse_lens_csv(self):
+        initial = self.lens_csv_path.parent if self.lens_csv_path else self.last_dir
+        path = filedialog.askopenfilename(
+            title="Select lens list CSV",
+            initialdir=initial,
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if path:
+            self._load_lens_csv(Path(path))
+
+    def _load_lens_csv(self, path: Path, quiet: bool = False):
+        try:
+            lenses = load_lens_csv(path)
+        except (OSError, csv.Error, UnicodeDecodeError) as exc:
+            log.warning("Could not read lens CSV %s: %s", path, exc)
+            if not quiet:
+                messagebox.showerror(APP_NAME, f"Could not read the CSV:\n{exc}")
+            return
+        if not lenses:
+            if not quiet:
+                messagebox.showwarning(
+                    APP_NAME,
+                    "No lenses found. Expected columns: Lens Maker, Lens Model, "
+                    "Focal Length, Aperture.",
+                )
+            return
+        self.lens_csv_path = path
+        self.csv_lenses = lenses
+        self.config_data["lens_csv_path"] = str(path)
+        save_config(self.config_data)
+        self.csv_status_var.set(f"{path.name} ({len(lenses)} lenses)")
+        self.pick_csv_btn.config(state="normal")
+        log.info("Loaded %d lens(es) from %s", len(lenses), path)
+        self._log(f"Loaded {len(lenses)} lens(es) from {path.name}")
+
+    def _pick_from_csv(self):
+        if not self.csv_lenses:
+            return
+        lens = LensPickerDialog(self, self.csv_lenses, self.presets, self._px).result
+        if not lens:
+            return
+        # The fields no longer reflect whichever preset was showing
+        self.preset_var.set("")
+        self.focal_length_var.set(lens["focal_length"])
+        self.lens_maker_var.set(lens["maker"])
+        self.lens_model_var.set(lens["lens_model"])
+        log.info("Filled fields from CSV row: %s", lens)
+        self._log(f"Filled from lens list: {lens['lens_model']} ({lens['focal']})")
+        if lens["is_zoom"]:
+            self._log(
+                f"Note: {lens['focal']} is a zoom — Focal Length was set to the wide end; "
+                "edit it to match the shots if needed."
+            )
 
     # ---- apply -----------------------------------------------
 

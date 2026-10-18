@@ -19,3 +19,6 @@ config.json
 presets.json
 *.log
 logs/
+
+# Personal lens list CSV
+Current Lenses.csv
