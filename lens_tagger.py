@@ -387,6 +387,9 @@ class CR3LensTagger(tk.Tk):
         self.selected_files: list[Path] = []
         self.lens_csv_path: Path | None = None
         self.csv_lenses: list[dict] = []
+        # Modification time of the CSV when it was last loaded, so edits
+        # made in an external program are picked up when the app regains focus.
+        self._csv_mtime: float | None = None
 
         # Start at the last folder used, falling back to this user's
         # Pictures folder (resolved dynamically, never hardcoded).
@@ -400,6 +403,8 @@ class CR3LensTagger(tk.Tk):
         saved_csv = self.config_data.get("lens_csv_path")
         if saved_csv and Path(saved_csv).is_file():
             self._load_lens_csv(Path(saved_csv), quiet=True)
+
+        self.bind("<FocusIn>", self._on_app_focus)
 
         if self.exiftool_path:
             log.info("Using exiftool at: %s", self.exiftool_path)
@@ -489,6 +494,12 @@ class CR3LensTagger(tk.Tk):
             csv_row, text="Pick lens from CSV...", command=self._pick_from_csv, state="disabled"
         )
         self.pick_csv_btn.pack(side="left")
+        self.edit_csv_btn = ttk.Menubutton(csv_row, text="Edit CSV", state="disabled")
+        self.edit_csv_menu = tk.Menu(
+            self.edit_csv_btn, tearoff=False, postcommand=self._build_edit_csv_menu
+        )
+        self.edit_csv_btn["menu"] = self.edit_csv_menu
+        self.edit_csv_btn.pack(side="left", padx=self._px(6))
         self.csv_status_var = tk.StringVar(value="No CSV loaded")
         ttk.Label(csv_row, textvariable=self.csv_status_var).pack(side="left", padx=self._px(8))
 
@@ -861,12 +872,96 @@ class CR3LensTagger(tk.Tk):
             return
         self.lens_csv_path = path
         self.csv_lenses = lenses
+        self._csv_mtime = self._get_mtime(path)
         self.config_data["lens_csv_path"] = str(path)
         save_config(self.config_data)
         self.csv_status_var.set(f"{path.name} ({len(lenses)} lenses)")
         self.pick_csv_btn.config(state="normal")
+        self.edit_csv_btn.config(state="normal")
         log.info("Loaded %d lens(es) from %s", len(lenses), path)
         self._log(f"Loaded {len(lenses)} lens(es) from {path.name}")
+
+    @staticmethod
+    def _get_mtime(path: Path) -> float | None:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return None
+
+    def _on_app_focus(self, event):
+        # FocusIn fires for every widget; only react when the app as a whole
+        # comes back to the foreground (e.g. after editing the CSV elsewhere).
+        if event.widget is not self or not self.lens_csv_path:
+            return
+        mtime = self._get_mtime(self.lens_csv_path)
+        if mtime is None or mtime == self._csv_mtime:
+            return
+        # Record it first so a broken edit only produces one error popup
+        self._csv_mtime = mtime
+        log.info("Lens CSV changed on disk, reloading: %s", self.lens_csv_path)
+        self._load_lens_csv(self.lens_csv_path)
+
+    def _build_edit_csv_menu(self):
+        menu = self.edit_csv_menu
+        menu.delete(0, "end")
+        default_label = "Open in Windows default app" if os.name == "nt" else "Open in default app"
+        menu.add_command(label=default_label, command=self._open_csv_default)
+        editor = self.config_data.get("csv_editor_path")
+        if editor:
+            menu.add_command(
+                label=f"Open with {Path(editor).stem}",
+                command=lambda: self._open_csv_with(editor),
+            )
+        menu.add_command(label="Open with another program...", command=self._choose_csv_editor)
+
+    def _csv_to_edit(self) -> Path | None:
+        if self.lens_csv_path and self.lens_csv_path.is_file():
+            return self.lens_csv_path
+        messagebox.showerror(APP_NAME, f"The lens CSV could not be found:\n{self.lens_csv_path}")
+        return None
+
+    def _open_csv_default(self):
+        path = self._csv_to_edit()
+        if not path:
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(path)
+            else:
+                subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(path)])
+        except OSError as exc:
+            log.warning("Could not open %s in default app: %s", path, exc)
+            messagebox.showerror(
+                APP_NAME,
+                f"Could not open the CSV in the default app:\n{exc}\n\n"
+                "Try 'Open with another program...' instead.",
+            )
+            return
+        log.info("Opened lens CSV in default app: %s", path)
+        self._log(f"Opened {path.name} for editing — changes load when you return here")
+
+    def _open_csv_with(self, editor: str):
+        path = self._csv_to_edit()
+        if not path:
+            return
+        try:
+            subprocess.Popen([editor, str(path)])
+        except OSError as exc:
+            log.warning("Could not open %s with %s: %s", path, editor, exc)
+            messagebox.showerror(APP_NAME, f"Could not start {editor}:\n{exc}")
+            return
+        log.info("Opened lens CSV with %s: %s", editor, path)
+        self._log(f"Opened {path.name} in {Path(editor).stem} — changes load when you return here")
+
+    def _choose_csv_editor(self):
+        filetypes = [("Programs", "*.exe"), ("All files", "*.*")] if os.name == "nt" else [("All files", "*")]
+        editor = filedialog.askopenfilename(title="Choose a program to edit the CSV", filetypes=filetypes)
+        if not editor:
+            return
+        self.config_data["csv_editor_path"] = editor
+        save_config(self.config_data)
+        log.info("CSV editor set and saved: %s", editor)
+        self._open_csv_with(editor)
 
     def _pick_from_csv(self):
         if not self.csv_lenses:

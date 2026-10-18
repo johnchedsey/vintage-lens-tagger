@@ -40,6 +40,10 @@ electronically.
      a row fills Focal Length, Lens Maker, and a Lens Model built from maker,
      model, and aperture (e.g. `Fuji Fujinon f1.8`). All fields stay
      editable. The CSV location is remembered between sessions.
+   - **Edit CSV** opens the lens list in your Windows default app for `.csv`
+     files, or in a program you choose (e.g. Excel or Notepad++; the choice
+     is remembered). Save your changes there, and they load automatically
+     when you switch back to the tagger.
 3. **Save current as preset** stores whatever's in the fields for reuse next
    time you shoot with that lens (presets persist between sessions, stored in
    `%APPDATA%\CR3LensTagger\presets.json`).
